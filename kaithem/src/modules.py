@@ -3,12 +3,16 @@
 # File for keeping track of and editing kaithem modules(not python modules)
 import copy
 import gc
+import glob
+import json
 import logging
 import os
 import re
 import shutil
 import time
 import traceback
+import urllib.parse
+import uuid
 import weakref
 import zipfile
 from io import BytesIO
@@ -226,6 +230,10 @@ def initModules() -> None:
         os.makedirs(directories.moduledir, exist_ok=True)
 
     try:
+        # Finish or undo any module replacement interrupted by a crash
+        # or killed process before we load anything.
+        recover_pending_module_uploads()
+
         # __COMPLETE__ is a special file we write to the
         # dump directory to show it as valid
         possibledir = os.path.join(directories.moduledir, "data")
@@ -304,258 +312,566 @@ def _detect_ignorable(path: str) -> bool:
     return False
 
 
-def loadModule(
+def _scan_module_folder(
     folder: str,
     modulename: str,
     resource_folder: str | None = None,
-) -> None:
-    """Load a single module but don't bookkeep it
-     and actually init everything with resource types.
-    Used by loadModules"""
-    logger.debug(f"Attempting to load module {modulename}")
+    strict: bool = False,
+) -> dict[str, ResourceDictType]:
+    """Read every resource in a module folder and return the resource
+    dict, without registering the module anywhere.
+
+    In strict mode, the first resource that fails to parse or validate
+    raises instead of being skipped with an error notification. This is
+    used to fully vet an uploaded module before it is allowed to take
+    over from a currently running one."""
+    logger.debug(f"Scanning module folder {modulename}: {folder}")
 
     if not resource_folder:
         resource_folder = os.path.join(folder, "__filedata__")
 
-    with modulesLock:
-        # Make an empty dict to hold the module resources
-        module: dict[str, ResourceDictType] = {}
+    # Make an empty dict to hold the module resources
+    module: dict[str, ResourceDictType] = {}
 
-        for t in resource_types:
-            try:
-                found = resource_types[t].scan_dir(folder)
-            except Exception:
-                messagebus.post_message(
-                    "/system/notifications/errors",
-                    f"Loading resource type {t}: {traceback.format_exc(4)}",
-                )
-            else:
-                for rn in found:
-                    rsc = modules_state.normalize_resource_data(found[rn])
-                    module[rn] = rsc
+    for t in resource_types:
+        try:
+            found = resource_types[t].scan_dir(folder)
+        except Exception:
+            if strict:
+                raise
+            messagebus.post_message(
+                "/system/notifications/errors",
+                f"Loading resource type {t}: {traceback.format_exc(4)}",
+            )
+        else:
+            for rn in found:
+                rsc = modules_state.normalize_resource_data(found[rn])
+                module[rn] = rsc
 
-        # Iterate over all resource files and load them
-        for root, dirs, files in os.walk(folder):
-            # Function used to ignore things like VCS folders and such
-            if ignore_func(root):
-                continue
+    # Iterate over all resource files and load them
+    for root, dirs, files in os.walk(folder):
+        # Function used to ignore things like VCS folders and such
+        if ignore_func(root):
+            continue
 
-            if root.startswith(resource_folder):
-                continue
+        if root.startswith(resource_folder):
+            continue
 
-            # Handle all resources that have unusual file types.
+        # Handle all resources that have unusual file types.
 
-            # TODO multiple storage types for one
-            # Name mean we can have conflicts, detect and warn
-            for i in dirs:
-                if not ignore_func(i):
-                    for t in resource_types:
-                        abs = os.path.join(root, i)
-                        rel = os.path.relpath(abs, folder)
-                        try:
-                            found = resource_types[t].scan_dir(abs)
-                        except Exception:
-                            messagebus.post_message(
-                                "/system/notifications/errors",
-                                f"resource type {t}: {traceback.format_exc(4)}",
-                            )
-                        else:
-                            found = copy.deepcopy(found)
-                            for rn in found:
-                                rsc = modules_state.normalize_resource_data(
-                                    found[rn]
-                                )
-                                if rel:
-                                    module[rel + "/" + rn] = rsc
-                                else:
-                                    module[rn] = rsc
-
-            for i in files:
-                # For testing
-                if ".fail_to_load_this_module_instantly" in i:
-                    raise RuntimeError(
-                        f"File {i} in module {modulename} is a fail to load"
-                    )
-
-                relfn = os.path.relpath(os.path.join(root, i), folder)
-                fn = os.path.join(folder, relfn)
-                if ignore_func(i):
-                    continue
-
-                if "/." in fn:
-                    continue
-
-                if fn.endswith((".yaml", ".json", ".toml")):
+        # TODO multiple storage types for one
+        # Name mean we can have conflicts, detect and warn
+        for i in dirs:
+            if not ignore_func(i):
+                for t in resource_types:
+                    abs = os.path.join(root, i)
+                    rel = os.path.relpath(abs, folder)
                     try:
-                        try:
-                            r, resourcename = readResourceFromFile(fn, relfn)
-                            if not r or not resourcename:
-                                # File managers sprinkle this crap around
-                                if not os.path.basename(fn) == ".directory":
-                                    logger.exception(f"Null loading {fn}")
-                                continue
-
-                        except Exception:
-                            logger.exception(f"Error loading {fn}")
-                            continue
-
-                        module[resourcename] = r
-                        if "resource" not in r or "type" not in r["resource"]:
-                            logger.warning(
-                                f"No resource type found for {resourcename}"
-                            )
-                            continue
-
+                        found = resource_types[t].scan_dir(abs)
                     except Exception:
+                        if strict:
+                            raise
                         messagebus.post_message(
                             "/system/notifications/errors",
-                            f"Error loading: {fn}\r\n{traceback.format_exc()}",
+                            f"resource type {t}: {traceback.format_exc(4)}",
                         )
+                    else:
+                        found = copy.deepcopy(found)
+                        for rn in found:
+                            rsc = modules_state.normalize_resource_data(
+                                found[rn]
+                            )
+                            if rel:
+                                module[rel + "/" + rn] = rsc
+                            else:
+                                module[rn] = rsc
+
+        for i in files:
+            # For testing
+            if ".fail_to_load_this_module_instantly" in i:
+                raise RuntimeError(
+                    f"File {i} in module {modulename} is a fail to load"
+                )
+
+            relfn = os.path.relpath(os.path.join(root, i), folder)
+            fn = os.path.join(folder, relfn)
+            if ignore_func(i):
+                continue
+
+            if "/." in fn:
+                continue
+
+            if fn.endswith((".yaml", ".json", ".toml")):
+                try:
+                    r, resourcename = readResourceFromFile(fn, relfn)
+                    if not r or not resourcename:
+                        # File managers sprinkle this crap around
+                        if not os.path.basename(fn) == ".directory":
+                            logger.exception(f"Null loading {fn}")
+                        continue
+
+                    module[resourcename] = r
+                    if "resource" not in r or "type" not in r["resource"]:
+                        logger.warning(
+                            f"No resource type found for {resourcename}"
+                        )
+                        continue
+
+                except Exception:
+                    if strict:
                         raise
+                    messagebus.post_message(
+                        "/system/notifications/errors",
+                        f"Error loading: {fn}\r\n{traceback.format_exc()}",
+                    )
 
-            for i in dirs:
-                if ignore_func(i):
-                    continue
-                relfn = os.path.relpath(os.path.join(root, i), folder)
-                fn = os.path.join(folder, relfn)
+        for i in dirs:
+            if ignore_func(i):
+                continue
+            relfn = os.path.relpath(os.path.join(root, i), folder)
 
-                # Create a directory resource for the dirrctory
-                module[util.unurl(relfn)] = {"resource": {"type": "directory"}}
+            # Create a directory resource for the dirrctory
+            module[util.unurl(relfn)] = {"resource": {"type": "directory"}}
 
-        if "__metadata__" not in module:
-            module["__metadata__"] = {
-                "resource": {
-                    "type": "module_metadata",
-                    "modified": int(time.time()),
-                },
-                "description": "",
-            }
+    if "__metadata__" not in module:
+        module["__metadata__"] = {
+            "resource": {
+                "type": "module_metadata",
+                "modified": int(time.time()),
+            },
+            "description": "",
+        }
+
+    if strict:
+        # Fully vet every resource before the module can take over.
+        for rn, r in list(module.items()):
+            rt = r.get("resource", {}).get("type")
+            if isinstance(rt, str) and rt in resource_types:
+                resource_types[rt]._validate(r)
+
+    return module
+
+
+def loadModule(
+    folder: str,
+    modulename: str,
+    resource_folder: str | None = None,
+    notify: bool = True,
+) -> None:
+    """Load a single module but don't bookkeep it
+     and actually init everything with resource types.
+    Used by loadModules.
+
+    notify=False suppresses the /system/modules/loaded message, for use
+    by transactional switch code that posts exactly one itself."""
+    with modulesLock:
+        module = _scan_module_folder(
+            folder, modulename, resource_folder=resource_folder
+        )
 
         scopes[modulename] = ModuleObject(modulename)
         modules_state.ActiveModules[modulename] = module
         modules_state.importFiledataFolderStructure(modulename)
-        messagebus.post_message("/system/modules/loaded", modulename)
+        if notify:
+            messagebus.post_message("/system/modules/loaded", modulename)
+
+
+# Folders holding in-flight upload state, siblings of the live "data"
+# directory so a normal module scan can never pick them up. Everything
+# here lives on the same filesystem as the module data, so directory
+# renames into place are atomic.
+UPLOAD_TXN_DIRNAME = "__txn__"
+LEGACY_UPLOAD_DIRNAME = "__upload__"
+LEGACY_BACKUP_DIRNAME = "__backup__"
+
+
+def _module_data_root() -> str:
+    return os.path.join(directories.moduledir, "data")
+
+
+def _upload_txn_root() -> str:
+    return os.path.join(directories.moduledir, UPLOAD_TXN_DIRNAME)
+
+
+def _safe_rmtree(path: str, base: str) -> None:
+    """rmtree with a paranoid containment check."""
+    path = os.path.abspath(path)
+    base = os.path.abspath(base)
+    if path == base or not path.startswith(base + os.path.sep):
+        raise AssertionError(f"Refusing to remove {path}, outside {base}")
+    shutil.rmtree(path)
+
+
+def _fsync_dir(path: str) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _atomic_write_json(path: str, obj: dict) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.rename(tmp, path)
+    _fsync_dir(os.path.dirname(path))
+
+
+def _txn_marker_path(tdir: str, module: str) -> str:
+    safe = urllib.parse.quote(module, safe="")
+    return os.path.join(tdir, f"marker-{safe}.json")
+
+
+def _txn_has_markers(tdir: str) -> bool:
+    return bool(glob.glob(os.path.join(tdir, "marker-*.json")))
+
+
+def _quiesce_module_runtime(module: str) -> dict[str, ResourceDictType] | None:
+    """Remove a running module from memory and unload all of its runtime
+    objects, but do NOT touch its files, permissions, hashes, or post any
+    lifecycle notifications. Used to quietly unload the old version right
+    before a validated new version takes over."""
+    with modulesLock:
+        if module not in modules_state.ActiveModules:
+            return None
+        x = modules_state.ActiveModules.pop(module)
+        j = {
+            i: copy.deepcopy(x[i])
+            for i in x
+            if not isinstance(x[i], weakref.ref)
+        }
+        scopes.pop(module, None)
+
+    for i in resource_types:
+        resource_types[i].on_delete_module(module)
+
+    for k in j:
+        rt = j[k].get("resource", {}).get("type")
+        if isinstance(rt, str) and rt in resource_types:
+            try:
+                resource_types[rt].on_unload(module, k, j[k])
+            except Exception:
+                logging.exception("Error deleting resource type")
+                messagebus.post_message(
+                    "/system/notifications/errors",
+                    f"Error deleting resource: {module},{k}",
+                )
+
+    gc.collect()
+    return j
+
+
+def _rollback_module_upload(
+    module: str,
+    tdir: str,
+    replacing: bool,
+) -> None:
+    """Undo a module switch that failed after the on-disk cutover.
+
+    Runs with the modules lock held. The transaction marker is removed
+    only once the previous version is fully serving again; otherwise it
+    is left for startup recovery."""
+    marker = _txn_marker_path(tdir, module)
+    dest = os.path.join(_module_data_root(), module)
+    old_backup = os.path.join(tdir, "old", module)
+
+    _quiesce_module_runtime(module)
+
+    restored = False
+    try:
+        if replacing:
+            if os.path.isdir(dest):
+                _safe_rmtree(dest, directories.moduledir)
+            os.rename(old_backup, dest)
+            loadModule(dest, module, notify=False)
+            bookkeeponemodule(module, notify=False)
+        else:
+            if os.path.isdir(dest):
+                _safe_rmtree(dest, directories.moduledir)
+        restored = True
+    finally:
+        # Keep permissions and hashes consistent with whichever version
+        # is now in ActiveModules. Only consume the marker once the
+        # previous version is actually serving again.
+        try:
+            auth.importPermissionsFromModules()
+            modules_state.recalcModuleHashes()
+        finally:
+            if restored and os.path.exists(marker):
+                os.remove(marker)
+
+
+def _commit_module_upload(
+    module: str,
+    staged: str,
+    replace: bool,
+    tdir: str,
+) -> None:
+    """Switch one extracted module folder in as a recoverable
+    transaction.
+
+    The old module keeps serving until the new content has been fully
+    parsed and validated; disk state then changes via same-fs atomic
+    renames and only afterwards is the runtime swapped. Any failure
+    restores the previous version in memory and on disk."""
+    dest = os.path.join(_module_data_root(), module)
+    replacing = module in modules_state.ActiveModules
+
+    # Reject before changing anything.
+    if replacing:
+        if "module_lock" in modules_state.get_module_metadata(module):
+            raise PermissionError("Old module is locked")
+        if not replace:
+            raise RuntimeError(f"Module {module} already loaded")
+        if module in external_module_locations:
+            raise RuntimeError(f"Module {module} is an external module")
+
+    # Fully parse and validate the new content while the old version is
+    # completely untouched.
+    _scan_module_folder(staged, module, strict=True)
+
+    marker = _txn_marker_path(tdir, module)
+    old_backup = os.path.join(tdir, "old", module)
+    os.makedirs(os.path.join(tdir, "old"), exist_ok=True)
+    _atomic_write_json(
+        marker,
+        {"version": 1, "module": module, "started": time.time()},
+    )
+
+    # Durable on-disk cutover and runtime switch are all under
+    # rollback protection: the old runtime objects are only unloaded
+    # after the atomic renames, and no other thread can observe the
+    # intermediate state because the modules lock is held throughout.
+    try:
+        if replacing:
+            os.rename(dest, old_backup)
+        os.rename(staged, dest)
+        _fsync_dir(_module_data_root())
+
+        if replacing:
+            _quiesce_module_runtime(module)
+
+        loadModule(dest, module, notify=False)
+        bookkeeponemodule(module, strict=True, notify=False)
+    except Exception:
+        logger.exception(
+            "Uploaded module %s failed to initialize; rolling back", module
+        )
+        _rollback_module_upload(module, tdir, replacing)
+        messagebus.post_message(
+            "/system/notifications/errors",
+            f"Uploaded version of module {module} failed to load; "
+            "continued running the previous version",
+        )
+        raise
+
+    # New version is fully live: permissions, hashes and notifications
+    # must reflect only it.
+    auth.importPermissionsFromModules()
+    modules_state.recalcModuleHashes()
+    messagebus.post_message("/system/modules/loaded", module)
+
+    # Commit point: delete the marker before the old backup, so a crash
+    # in between leaves only an orphan backup folder and startup
+    # recovery will never discard the now-committed new version.
+    os.remove(marker)
+    _fsync_dir(tdir)
+    if replacing and os.path.isdir(old_backup):
+        _safe_rmtree(old_backup, tdir)
 
 
 def load_modules_from_zip(f: BytesIO, replace: bool = False) -> None:
-    """Given a zip file, import all modules found therin.
-    On failure, revert to existing module if replacing"""
+    """Given a zip file, import all modules found therein.
+
+    Each module commits independently as a recoverable switch: its
+    content is validated before anything is replaced, the on-disk
+    cutover uses atomic renames under a durable transaction marker, and
+    any failure (including a killed process) restores the previous
+    version rather than leaving two versions mixed."""
     z = zipfile.ZipFile(f)
-    tmp = os.path.join(directories.vardir, "modules", "__upload__")
-    bu = os.path.join(directories.vardir, "modules", "__backup__")
-
-    if os.path.exists(bu):
-        shutil.rmtree(bu)
-    if os.path.exists(tmp):
-        shutil.rmtree(tmp)
-
-    os.makedirs(bu)
+    tdir = os.path.join(
+        _upload_txn_root(), f"upload-{os.getpid()}-{uuid.uuid4().hex}"
+    )
+    new_root = os.path.join(tdir, "new")
+    os.makedirs(new_root)
 
     try:
         with modulesLock:
-            z.extractall(tmp)
+            z.extractall(new_root)
 
-            for i in os.listdir(tmp):
-                temp_module_folder = os.path.join(tmp, i)
-                if os.path.isdir(temp_module_folder):
-                    old_module_dir = None
-                    m_backup = None
-                    if i in modules_state.ActiveModules:
-                        if "module_lock" in modules_state.get_module_metadata(
-                            i
-                        ):
-                            raise PermissionError("Old module is locked")
+            # Snapshot before any folders get renamed into place.
+            names = sorted(
+                i
+                for i in os.listdir(new_root)
+                if os.path.isdir(os.path.join(new_root, i))
+            )
 
-                        old_module_dir = getModuleDir(i)
-                        if not replace:
-                            raise RuntimeError(f"Module {i} already loaded")
-                        if i in external_module_locations:
-                            raise RuntimeError(
-                                f"Module {i} is an external module"
-                            )
-
-                        shutil.move(old_module_dir, bu)
-                        m_backup = os.path.join(bu, i)
-                        rmModule(i)
-                    try:
-                        dest = os.path.join(
-                            directories.vardir, "modules", "data", i
-                        )
-                        shutil.move(
-                            temp_module_folder,
-                            dest,
-                        )
-                        loadModule(dest, i)
-                        bookkeeponemodule(i)
-                        # Purely defensive try catch since
-                        # we're adding close to release
-                        # Todo: Remove?
-                        try:
-                            modules_state.importFiledataFolderStructure(i)
-                        except Exception:
-                            messagebus.post_message(
-                                "/system/notifications/errors",
-                                f"Error importing filedata for module {i}",
-                            )
-
-                    except Exception:
-                        if old_module_dir and m_backup:
-                            try:
-                                if i in modules_state.ActiveModules:
-                                    rmModule(i)
-                            except Exception:
-                                logger.exception(
-                                    "Failed to remove module on upload failure"
-                                )
-
-                            shutil.move(
-                                m_backup, os.path.dirname(old_module_dir)
-                            )
-                            loadModule(old_module_dir, i)
-                            bookkeeponemodule(i)
-                        else:
-                            failed_module_folder = os.path.join(
-                                directories.vardir, "modules", "data", i
-                            )
-                            # Paranoid asserts are needed with rmtree
-                            assert os.path.abspath(
-                                failed_module_folder
-                            ).startswith(
-                                os.path.abspath(
-                                    os.path.join(directories.vardir, "modules")
-                                )
-                            )
-
-                            if os.path.isdir(failed_module_folder):
-                                shutil.rmtree(failed_module_folder)
-
-                        raise
-
+            for i in names:
+                _commit_module_upload(
+                    i, os.path.join(new_root, i), replace, tdir
+                )
     finally:
-        if os.path.exists(bu):
-            shutil.rmtree(bu)
-        if os.path.exists(tmp):
-            shutil.rmtree(tmp)
+        z.close()
+        # With no markers left, every module either committed or rolled
+        # back and only extraction debris remains. If a marker survives,
+        # a catastrophic failure occurred and startup recovery must
+        # finish the rollback.
+        if os.path.isdir(tdir) and not _txn_has_markers(tdir):
+            _safe_rmtree(tdir, directories.moduledir)
+            root = _upload_txn_root()
+            try:
+                if os.path.isdir(root) and not os.listdir(root):
+                    os.rmdir(root)
+            except OSError:
+                pass
 
-    z.close()
+
+def recover_pending_module_uploads() -> None:
+    """Roll back module replacements interrupted by a crash or killed
+    process. Must run at startup before the data directory is loaded.
+
+    A surviving marker means the switch never reached its commit point:
+    restore the previous version when one exists, otherwise discard the
+    partially uploaded new module. Also cleans leftovers from older
+    releases and any orphaned transaction folders."""
+    os.makedirs(directories.moduledir, exist_ok=True)
+    data_root = _module_data_root()
+
+    txn_root = _upload_txn_root()
+    if os.path.isdir(txn_root):
+        for token in sorted(os.listdir(txn_root)):
+            tdir = os.path.join(txn_root, token)
+            if not os.path.isdir(tdir):
+                continue
+
+            for mp in sorted(glob.glob(os.path.join(tdir, "marker-*.json"))):
+                module = None
+                try:
+                    with open(mp) as fh:
+                        info = json.load(fh)
+                    module = info.get("module")
+                    if (
+                        not module
+                        or "/" in module
+                        or ".." in module
+                        or module.startswith(".")
+                    ):
+                        logger.error(
+                            "Ignoring invalid module upload marker %s", mp
+                        )
+                        os.remove(mp)
+                        continue
+
+                    dest = os.path.join(data_root, module)
+                    old_backup = os.path.join(tdir, "old", module)
+
+                    if os.path.isdir(old_backup):
+                        logger.warning(
+                            "Interrupted replacement of module %s; "
+                            "restoring previous version",
+                            module,
+                        )
+                        if os.path.isdir(dest):
+                            _safe_rmtree(dest, directories.moduledir)
+                        os.makedirs(data_root, exist_ok=True)
+                        os.rename(old_backup, dest)
+                        messagebus.post_message(
+                            "/system/notifications/errors",
+                            f"Interrupted update of module {module}; "
+                            "previous version restored",
+                        )
+                    else:
+                        logger.warning(
+                            "Interrupted new module upload for %s; discarding",
+                            module,
+                        )
+                        if os.path.isdir(dest):
+                            _safe_rmtree(dest, directories.moduledir)
+
+                    os.remove(mp)
+                except Exception:
+                    logger.exception(
+                        "Failed to recover interrupted module upload %s", mp
+                    )
+
+            try:
+                if not _txn_has_markers(tdir):
+                    _safe_rmtree(tdir, directories.moduledir)
+            except Exception:
+                logger.exception("Failed to clean transaction folder %s", tdir)
+
+        try:
+            if os.path.isdir(txn_root) and not os.listdir(txn_root):
+                os.rmdir(txn_root)
+        except OSError:
+            pass
+
+    # Leftovers from the pre-transactional upload implementation:
+    # a surviving backup always meant an interrupted replacement.
+    legacy_backup = os.path.join(directories.moduledir, LEGACY_BACKUP_DIRNAME)
+    if os.path.isdir(legacy_backup):
+        for module in sorted(os.listdir(legacy_backup)):
+            old = os.path.join(legacy_backup, module)
+            if not os.path.isdir(old):
+                continue
+            dest = os.path.join(data_root, module)
+            try:
+                if os.path.isdir(dest):
+                    _safe_rmtree(dest, directories.moduledir)
+                os.makedirs(data_root, exist_ok=True)
+                os.rename(old, dest)
+                logger.warning(
+                    "Restored module %s from interrupted legacy upload",
+                    module,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to restore legacy backup for module %s", module
+                )
+        try:
+            _safe_rmtree(legacy_backup, directories.moduledir)
+        except Exception:
+            logger.exception("Failed to remove legacy upload backup folder")
+
+    legacy_upload = os.path.join(directories.moduledir, LEGACY_UPLOAD_DIRNAME)
+    if os.path.isdir(legacy_upload):
+        try:
+            _safe_rmtree(legacy_upload, directories.moduledir)
+        except Exception:
+            logger.exception("Failed to remove legacy upload temp folder")
 
 
-def bookkeeponemodule(module: str, update: bool = False) -> None:
+def bookkeeponemodule(
+    module: str,
+    update: bool = False,
+    strict: bool = False,
+    notify: bool = True,
+) -> None:
     """Given the name of one module that has been copied to
     modules_state.ActiveModules but nothing else,
-    let the rest of the system know the module is there."""
+    let the rest of the system know the module is there.
+
+    In strict mode, a resource that fails to initialize raises instead
+    of leaving the module partially initialized, so transactional
+    uploads can roll back. notify=False suppresses the loaded message.
+    """
 
     if module not in scopes:
         scopes[module] = ModuleObject(module)
 
     for i in modules_state.ActiveModules[module]:
         # Handle events separately due to dependency resolution logic
-        rt = modules_state.ActiveModules[module][i]["resource"]["type"]
-        assert isinstance(rt, str)
-
         try:
             handleResourceChange(module, i, newly_added=not update)
         except Exception:
+            if strict:
+                raise
             messagebus.post_message(
                 "/system/notifications/errors", f"Failed to load  resource: {i}"
             )
@@ -563,7 +879,7 @@ def bookkeeponemodule(module: str, update: bool = False) -> None:
     for i in modules_state.resource_types:
         modules_state.resource_types[i].on_finished_loading(module)
 
-    if not update:
+    if notify and not update:
         messagebus.post_message("/system/modules/loaded", module)
 
 
