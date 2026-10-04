@@ -11,6 +11,7 @@ import threading
 import time
 import traceback
 import weakref
+from collections import deque
 from collections.abc import Callable
 from urllib.parse import quote
 
@@ -108,8 +109,8 @@ class TagLogger:
 
         self.getChannelID(tag)
 
-        with historian.lock:
-            historian.children[id(self)] = weakref.ref(self)
+        with self.h.lock:
+            self.h.children[id(self)] = weakref.ref(self)
 
         tag.subscribe(self.accumulate)
 
@@ -121,114 +122,24 @@ class TagLogger:
     def insertData(self, d):
         self.h.insertData(d)
 
-    def clearOldData(self, force=False):
-        "Only called by the historian, that's why we can reuse the connection and do everything in one transaction"
-        if not self.history_length:
-            return
-
-        # Attempt to detect impossible times indicating the clock is wrong.
-        if time.time() < 1597447271:
-            return
-
-        with self.h.lock:
-            conn = sqlite3.Connection(self.filename)
-
-            c = conn.cursor()
-            c.execute(
-                "SELECT count(*) FROM record WHERE channel=? AND time<?",
-                (
-                    self.chID,
-                    ts_to_iso(time.time() - self.history_length),
-                ),
-            )
-            count = c.fetchone()[0]
-
-            # Only delete records in large blocks. To do otherwise would create too much disk wear
-            if count > 8192 if not force else 1024:
-                c.execute(
-                    "DELETE FROM record WHERE channel=? AND time<?",
-                    (
-                        self.chID,
-                        ts_to_iso(time.time() - self.history_length),
-                    ),
-                )
-            conn.close()
-
     def getDataRange(self, minTime, maxTime, maxRecords=10000):
-        with self.h.lock:
-            d = []
-            conn = sqlite3.Connection(self.filename)
-
-            c = conn.cursor()
-            c.execute(
-                "SELECT time,value FROM record WHERE time>? AND time<? AND channel=? ORDER BY time ASC LIMIT ?",
-                (ts_to_iso(minTime), ts_to_iso(maxTime), self.chID, maxRecords),
-            )
-            for i in c:
-                d.append(i)
-
-            x = []
-            for safety_counter in range(10):
-                x = []
-                # Best-effort attempt to include recent stuff.
-                # We don't want to use another lock and slow stuff down
-                try:
-                    for i in self.h.pending_data_items:
-                        if i[0] == self.chID:
-                            if i[1] >= minTime and i[1] <= maxTime:
-                                x.append((i[1], i[2]))
-                    break
-                # Can fail due to iterationerror, we don't lock the pending list,
-                # We just hope we can finish very fast.
-                except Exception:
-                    raise
-            conn.close()
-
-            return (d + x)[:maxRecords]
+        return self.h.getDataRange(self.chID, minTime, maxTime, maxRecords)
 
     def getRecent(self, minTime, maxTime, maxRecords=10000):
-        with self.h.lock:
-            d = []
-            conn = sqlite3.Connection(self.filename)
-
-            c = conn.cursor()
-            c.execute(
-                "SELECT time,value FROM record WHERE time>? AND time<? AND channel=? ORDER BY time DESC LIMIT ?",
-                (ts_to_iso(minTime), ts_to_iso(maxTime), self.chID, maxRecords),
-            )
-            for i in c:
-                d.append(i)
-
-            x = []
-            for safety_counter in range(15):
-                x = []
-                # Best-effort attempt to include recent stuff.
-                # We don't want to use another lock and slow stuff down
-                try:
-                    for i in self.h.pending_data_items:
-                        if i[0] == self.chID:
-                            if i[1] >= minTime and i[1] <= maxTime:
-                                x.append((i[1], i[2]))
-                    break
-                # Can fail due to iterationerror, we don't lock the pending list,
-                # We just hope we can finish very fast.
-                except Exception:  # noqa: TRY203
-                    raise
-            conn.close()
-            return (list(reversed(d)) + x)[-maxRecords:]
+        return self.h.getRecent(self.chID, minTime, maxTime, maxRecords)
 
     def __del__(self):
         try:
-            if id(self) in historian.children:
-                del historian.children[id(self)]
+            if id(self) in self.h.children:
+                del self.h.children[id(self)]
                 logger.warning("Logger was deleted without being closed")
         # Del always does nuisance stuff at shutdown
         except Exception:
             pass
 
     def close(self):
-        with historian.lock:
-            del historian.children[id(self)]
+        with self.h.lock:
+            del self.h.children[id(self)]
 
     def accumulate(self, value, time, annotation):
         "Only ever called by the tag"
@@ -248,6 +159,10 @@ class TagLogger:
 
     # Only call from accumulate or from within the historian, which will use the taglock to call this.
     def flush(self, force=False):
+        # Nothing accumulated to log.
+        if not self.accumCount:
+            return
+
         # Ratelimit how often we log, continue accumulating if nothing to log.
         if not force:
             if self.lastLogged > time.time() - self.interval:
@@ -315,6 +230,10 @@ class AverageLogger(TagLogger):
 
     # Only call from accumulate or from within the historian, which will use the taglock to call this.
     def flush(self, force=False):
+        # Nothing accumulated to log.
+        if not self.accumCount:
+            return
+
         # Ratelimit how often we log, continue accumulating if nothing to log.
         if not force:
             if self.lastLogged > time.time() - self.interval:
@@ -347,6 +266,10 @@ class MinLogger(TagLogger):
 
     # Only call from accumulate or from within the historian, which will use the taglock to call this.
     def flush(self, force=False):
+        # Nothing accumulated to log.
+        if not self.accumCount:
+            return
+
         # Ratelimit how often we log, continue accumulating if nothing to log.
         if not force:
             if self.lastLogged > time.time() - self.interval:
@@ -375,6 +298,10 @@ class MaxLogger(MinLogger):
 
     # Only call from accumulate or from within the historian, which will use the taglock to call this.
     def flush(self, force=False):
+        # Nothing accumulated to log.
+        if not self.accumCount:
+            return
+
         # Ratelimit how often we log, continue accumulating if nothing to log.
         if not force:
             if self.lastLogged > time.time() - self.interval:
@@ -402,67 +329,51 @@ class TagHistorian:
     appID = 707898159
 
     def __init__(self, file):
-        if not os.path.exists(file):
-            newfile = True
-        else:
-            newfile = False
+        newfile = not os.path.exists(file)
+
+        self.lock = threading.RLock()
+        self.filename = file
+        self.journalFilename = file + ".pending.sqlite"
+        self.needsStartupReconcile = False
+        self.children: dict[
+            int, weakref.ReferenceType[TagLogger]
+        ] = {}
 
         self.history = sqlite3.Connection(file)
+        self.history.row_factory = sqlite3.Row
 
         try:
-            self.history.execute(
-                """CREATE TABLE IF NOT EXISTS channel  (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  name text, unit text, accumulate text, metadata text)"""
-            )
+            self._ensureSchema(self.history, newfile)
         except Exception:
-            shutil.move(file, file + ".error_archived")
+            logger.exception(
+                "Tag history db unreadable, archiving and recreating"
+            )
+            self.history.close()
+            self._archiveCorruptDb(file)
             newfile = True
             self.history = sqlite3.Connection(file)
+            self.history.row_factory = sqlite3.Row
+            self._ensureSchema(self.history, True)
 
-        self.history.row_factory = sqlite3.Row
-        self.filename = file
+        # Unacked samples in arrival order: (channelID, epochTime, value)
+        self.pending_data_items: deque[tuple] = deque()
 
-        if newfile:
-            self.history.execute("PRAGMA application_id = 707898159")
-        self.lock = threading.RLock()
-        self.children: dict[int, weakref.ReferenceType[TagLogger]] = {}
+        # Immutable snapshot of the batch currently being written.
+        self.inflight: tuple[tuple, ...] = ()
 
-        self.history.execute(
-            """CREATE TABLE IF NOT EXISTS channel  (id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name text, unit text, accumulate text, metadata text)"""
-        )
-        self.history.execute(
-            """CREATE TABLE IF NOT EXISTS record  (channel INTEGER,
-            time TEXT, value REAL, FOREIGN KEY(channel) REFERENCES channel(id))"""
-        )
+        # Journal connections are short-lived, like every other connection
+        # here, so they work from any (e.g. messagebus worker) thread.
+        self._initJournal()
 
-        self.history.execute(
-            """CREATE VIEW IF NOT EXISTS SimpleViewLocalTime AS SELECT
-            channel.name as Channel,
-            channel.accumulate as Type,
-            record.time as LocalTime,
-              record.value as Value,
-              channel.unit as Unit FROM record INNER JOIN channel ON channel.id = record.channel;"""
-        )
-        self.history.execute(
-            """CREATE VIEW IF NOT EXISTS SimpleViewUTC AS SELECT
-              channel.name as Channel,
-              channel.accumulate as Type,
-              record.time as UTCTime,
-              record.value as Value,
-              channel.unit as Unit FROM record INNER JOIN channel ON channel.id = record.channel;"""
-        )
-
-        # TODO: Legacy compatibility
+        # Batches that were committed but whose ack/cleanup failed are
+        # dropped; everything else is loaded for replay, in order.
         try:
-            self.history.execute("""ALTER TABLE record
-                RENAME COLUMN tagName TO name;""")
-            self.history.execute("""ALTER TABLE channel
-                    RENAME COLUMN tagName TO name;""")
+            recovered = self._reconcileJournal()
+            self.pending_data_items.extend(recovered)
         except Exception:
-            pass
-
-        self.pending_data_items = []
+            logger.exception("Startup journal reconcile failed; will retry")
+            self.needsStartupReconcile = True
+            recovered = []
 
         self.history.close()
 
@@ -474,7 +385,15 @@ class TagHistorian:
 
         self.gcInterval = 3600 * 2
 
-        messagebus.subscribe("/system/save", self.forceFlush)
+        # Plain function (held by this instance), not an ephemeral bound
+        # method, so messagebus's weakref stays alive for the subscription.
+        def forceFlushStable(*a):
+            self.flush(True)
+
+        self.forceFlushStable = forceFlushStable
+
+        messagebus.subscribe("/system/save", self.forceFlushStable)
+        messagebus.subscribe("/system/shutdown", self.forceFlushStable)
 
         def f():
             self.flush()
@@ -482,64 +401,492 @@ class TagHistorian:
         self.flusher_f = f
         self.flusher = scheduling.scheduler.every_minute(f)
 
-    def insertData(self, d):
-        self.pending_data_items.append(d)
+        # Continue unacknowledged batches promptly after a restart.
+        self.startup_flush = None
+        if recovered:
+            self.startup_flush = scheduling.scheduler.schedule(
+                self.flush, time.time() + 5
+            )
 
-    def forceFlush(self):
+    def _ensureSchema(self, conn, newfile):
+        if newfile:
+            conn.execute("PRAGMA application_id = 707898159")
+
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS channel  (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name text, unit text, accumulate text, metadata text)"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS record  (channel INTEGER,
+            time TEXT, value REAL, FOREIGN KEY(channel) REFERENCES channel(id))"""
+        )
+        # Needed for idempotent replay, range merges and retention checks.
+        conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_record_channel_time
+            ON record(channel, time)"""
+        )
+        conn.execute(
+            """CREATE VIEW IF NOT EXISTS SimpleViewLocalTime AS SELECT
+            channel.name as Channel,
+            channel.accumulate as Type,
+            record.time as LocalTime,
+              record.value as Value,
+              channel.unit as Unit FROM record INNER JOIN channel ON channel.id = record.channel;"""
+        )
+        conn.execute(
+            """CREATE VIEW IF NOT EXISTS SimpleViewUTC AS SELECT
+              channel.name as Channel,
+              channel.accumulate as Type,
+              record.time as UTCTime,
+              record.value as Value,
+              channel.unit as Unit FROM record INNER JOIN channel ON channel.id = record.channel;"""
+        )
+
+        # TODO: Legacy compatibility
+        try:
+            conn.execute("""ALTER TABLE record
+                RENAME COLUMN tagName TO name;""")
+            conn.execute("""ALTER TABLE channel
+                    RENAME COLUMN tagName TO name;""")
+        except Exception:
+            pass
+
+        conn.commit()
+
+    # ----- Persistent recovery journal ------------------------------------
+
+    def _jconn(self):
+        conn = sqlite3.Connection(self.journalFilename)
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS pendingbatch
+            (batch INTEGER, seq INTEGER, channel INTEGER,
+             ts REAL, value REAL, PRIMARY KEY(batch, seq))"""
+        )
+        return conn
+
+    def _initJournal(self):
+        try:
+            conn = self._jconn()
+            conn.commit()
+            conn.close()
+        except Exception:
+            # A broken journal must not take logging down; archive it.
+            logger.exception("Recovery journal unreadable, recreating")
+            try:
+                self._archiveCorruptDb(self.journalFilename)
+            except Exception:
+                logger.exception("Could not archive bad recovery journal")
+            conn = self._jconn()
+            conn.commit()
+            conn.close()
+
+    def _journalAdd(self, items):
+        "Durably record the batch BEFORE touching the main db."
+        conn = self._jconn()
+        try:
+            c = conn.execute(
+                "SELECT COALESCE(max(batch),0)+1 FROM pendingbatch"
+            )
+            batchid = c.fetchone()[0]
+            conn.executemany(
+                "INSERT INTO pendingbatch VALUES (?,?,?,?,?)",
+                [
+                    (batchid, seq, i[0], i[1], i[2])
+                    for seq, i in enumerate(items)
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return batchid
+
+    def _journalClear(self, batchid):
+        "Best effort; _reconcileJournal is the durable backstop."
+        conn = self._jconn()
+        try:
+            conn.execute(
+                "DELETE FROM pendingbatch WHERE batch=?", (batchid,)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _rowsPresent(self, rows):
+        """rows: iterable of (channel, epochTs, value).
+        True only if every (channel, iso time, value) is in record."""
+        byChannel = {}
+        for channel, ts, value in rows:
+            byChannel.setdefault(channel, []).append((ts, value))
+
+        conn = sqlite3.Connection(self.filename)
+        try:
+            for channel, chRows in byChannel.items():
+                lo = ts_to_iso(min(i[0] for i in chRows))
+                hi = ts_to_iso(max(i[0] for i in chRows))
+                c = conn.execute(
+                    "SELECT time, value FROM record "
+                    "WHERE channel=? AND time>=? AND time<=?",
+                    (channel, lo, hi),
+                )
+                existing = {(i[0], i[1]) for i in c}
+                for ts, value in chRows:
+                    if (ts_to_iso(ts), value) not in existing:
+                        return False
+        finally:
+            conn.close()
+        return True
+
+    def _reconcileJournal(self):
+        """Drop journal batches whose rows are already committed (commit
+        succeeded but ack/cleanup failed). Return remaining rows, in journal
+        order, as (channel, epoch, value)."""
+        conn = self._jconn()
+        try:
+            c = conn.execute(
+                "SELECT batch, seq, channel, ts, value FROM pendingbatch "
+                "ORDER BY batch, seq"
+            )
+            rows = c.fetchall()
+            if not rows:
+                return []
+
+            byBatch = {}
+            order = []
+            for batch, seq, channel, ts, value in rows:
+                if batch not in byBatch:
+                    byBatch[batch] = []
+                    order.append(batch)
+                byBatch[batch].append((seq, channel, ts, value))
+
+            recovered = []
+            for batch in order:
+                items = byBatch[batch]
+                present = self._rowsPresent(
+                    [(ch, ts, v) for seq, ch, ts, v in items]
+                )
+                if present:
+                    try:
+                        conn.execute(
+                            "DELETE FROM pendingbatch WHERE batch=?",
+                            (batch,),
+                        )
+                        conn.commit()
+                    except Exception:
+                        logger.exception(
+                            "Could not clear confirmed batch from journal"
+                        )
+                else:
+                    for seq, channel, ts, value in items:
+                        recovered.append((channel, ts, value))
+        finally:
+            conn.close()
+        return recovered
+
+    # ----- Corruption handling --------------------------------------------
+
+    def _archiveCorruptDb(self, file):
+        archive = file + ".error_archived"
+        if os.path.exists(archive):
+            archive = file + ".error_archived_" + iso_now().replace(":", "")
+        shutil.move(file, archive)
+        return archive
+
+    def _archiveAndRebuild(self):
+        """Move the corrupt db aside, create a fresh one, and salvage the
+        channel table so stored channel ids keep matching pending samples."""
+        archive = self._archiveCorruptDb(self.filename)
+
+        fresh = sqlite3.Connection(self.filename)
+        fresh.row_factory = sqlite3.Row
+        self._ensureSchema(fresh, True)
+
+        try:
+            fresh.execute("ATTACH ? AS olddb", (archive,))
+            fresh.execute(
+                """INSERT OR IGNORE INTO channel
+                (name, unit, accumulate, metadata)
+                SELECT name, unit, accumulate, metadata
+                FROM olddb.channel"""
+            )
+            fresh.commit()
+            fresh.execute("DETACH olddb")
+        except Exception:
+            # Journal batches are retained; samples stay recoverable even if
+            # channel mapping could not be salvaged.
+            logger.exception(
+                "Could not salvage channel table from corrupt db"
+            )
+        fresh.close()
+
+    # ----- Writing ---------------------------------------------------------
+
+    def _writeBatch(self, conn, items):
+        """Insert rows not already present. Always idempotent, so a replay
+        after an ambiguous commit failure can never duplicate data."""
+        byChannel = {}
+        for channel, ts, value in items:
+            byChannel.setdefault(channel, []).append((ts, value))
+
+        c = conn.cursor()
+        for channel, chRows in byChannel.items():
+            lo = ts_to_iso(min(i[0] for i in chRows))
+            hi = ts_to_iso(max(i[0] for i in chRows))
+            c.execute(
+                "SELECT time FROM record "
+                "WHERE channel=? AND time>=? AND time<=?",
+                (channel, lo, hi),
+            )
+            existing = {i[0] for i in c}
+            c.executemany(
+                "INSERT INTO record VALUES (?,?,?)",
+                [
+                    (channel, ts_to_iso(ts), value)
+                    for ts, value in chRows
+                    if ts_to_iso(ts) not in existing
+                ],
+            )
+
+    def _gc(self, conn, force, boundTs=None):
+        """Delete expired rows. boundTs is the oldest timestamp among
+        unacked items; rows at or after it are preserved, so nothing not yet
+        reliably written can be deleted."""
+        # Attempt to detect impossible times indicating the clock is wrong.
+        if time.time() < 1597447271:
+            return
+
+        boundIso = ts_to_iso(boundTs) if boundTs is not None else None
+        c = conn.cursor()
+
+        for i in self.children:
+            x = self.children[i]()
+            if not x or not x.history_length:
+                continue
+
+            cutoff = ts_to_iso(time.time() - x.history_length)
+
+            q = "SELECT count(*) FROM record WHERE channel=? AND time<?"
+            params: list = [x.chID, cutoff]
+            if boundIso:
+                q += " AND time<?"
+                params.append(boundIso)
+
+            c.execute(q, params)
+            count = c.fetchone()[0]
+
+            # Only delete records in large blocks to limit disk wear.
+            if count > (1024 if force else 8192):
+                q = "DELETE FROM record WHERE channel=? AND time<?"
+                params = [x.chID, cutoff]
+                if boundIso:
+                    q += " AND time<?"
+                    params.append(boundIso)
+                c.execute(q, params)
+
+    def insertData(self, d):
+        with self.lock:
+            self.pending_data_items.append(d)
+
+    def forceFlush(self, *a):
         self.flush(True)
 
+    def _requeue(self, items):
+        "Put failed samples back at the front, preserving original order."
+        for i in reversed(items):
+            self.pending_data_items.appendleft(i)
+
+    def _safeGCOnly(self, force):
+        try:
+            conn = sqlite3.Connection(self.filename)
+            try:
+                with conn:
+                    self._gc(conn, force)
+            finally:
+                conn.close()
+        except Exception:
+            logger.exception("History GC failed")
+
+    def _safeReconcile(self):
+        try:
+            self.pending_data_items.extend(self._reconcileJournal())
+        except Exception:
+            logger.exception("Journal reconcile failed")
+
     def flush(self, force=False):
-        if not force:
-            if time.time() - self.lastFlushed < self.flushInterval:
-                return
+        with self.lock:
+            if self.needsStartupReconcile:
+                self.needsStartupReconcile = False
+                self._safeReconcile()
+
+            # Recovered/retry batches bypass the interval gate, so they get
+            # another attempt roughly every minute.
+            if not force and not self.pending_data_items:
+                if time.time() - self.lastFlushed < self.flushInterval:
+                    return
             self.lastFlushed = time.time()
 
-        with self.lock:
-            needsGC = self.lastGarbageCollected < time.time() - self.gcInterval
+            needsGC = force or (
+                self.lastGarbageCollected < time.time() - self.gcInterval
+            )
             if needsGC:
                 self.lastGarbageCollected = time.time()
-            if force:
-                needsGC = 1
 
-            # Unfortunately, we still have to do some polling here.
-            # The reason is that we could have a change immediately followed by another change,
-            # and it is important that we eventually
-            # record that new change.
+            # Drain per-tag accumulators into the pending queue. It is
+            # important that a change right after the previous one is
+            # eventually recorded.
             for i in self.children:
                 x = self.children[i]()
-                if x:
-                    if x.accumCount:
-                        x.flush(force)
+                if x and x.accumCount:
+                    x.flush(force)
 
-            pending_data = self.pending_data_items
-            self.pending_data_items = []
-            # Hopefully let any other threads finish
-            # inserting into the old list . Note that here we consider very rarely losing a record
-            # to be better than bad performace
+            # Snapshot the queue, but keep every item until acknowledged.
+            items = []
+            while self.pending_data_items:
+                items.append(self.pending_data_items.popleft())
+            items = tuple(items)
 
-            for i in range(30):
-                time.sleep(0.001)
+            # Oldest unacked timestamp bounds GC for this transaction.
+            boundTs = items[0][1] if items else None
+            self.inflight = items
 
-            self.history = sqlite3.Connection(self.filename)
-            with self.history:
+            if not items:
+                self.inflight = ()
                 if needsGC:
-                    for i in self.children:
-                        x = self.children[i]()
-                        if x:
-                            x.clearOldData(force)
+                    self._safeGCOnly(force)
+                return
 
-                for i in pending_data:
-                    self.history.execute(
-                        "INSERT INTO record VALUES (?,?,?)",
-                        (i[0], ts_to_iso(i[1]), i[2]),
+            try:
+                batchid = self._journalAdd(items)
+            except Exception:
+                logger.exception(
+                    "Could not write recovery journal; "
+                    "keeping samples in memory"
+                )
+                self._requeue(items)
+                self.inflight = ()
+                return
+
+            conn = sqlite3.Connection(self.filename)
+            committed = False
+            try:
+                with conn:
+                    if needsGC:
+                        self._gc(conn, force, boundTs)
+                    self._writeBatch(conn, items)
+                # The with-block returned: COMMIT succeeded and is durable.
+                committed = True
+            except sqlite3.OperationalError:
+                # Locked, disk full, io error etc: retry in order, later.
+                logger.exception("History flush failed; will retry")
+            except sqlite3.DatabaseError:
+                # Corruption: archive and rebuild, then replay the batch.
+                logger.exception(
+                    "History db corrupt; archiving and rebuilding"
+                )
+                try:
+                    conn.close()
+                    self._archiveAndRebuild()
+                    conn2 = sqlite3.Connection(self.filename)
+                    try:
+                        with conn2:
+                            self._writeBatch(conn2, items)
+                        committed = True
+                    finally:
+                        conn2.close()
+                except Exception:
+                    logger.exception(
+                        "History flush failed after rebuild; will retry"
                     )
-            self.history.close()
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    logger.exception("Error closing history connection")
+
+            if committed:
+                # Commit is durable; nothing after this point may reinsert.
+                self.inflight = ()
+                try:
+                    self._journalClear(batchid)
+                except Exception:
+                    logger.exception(
+                        "Journal ack failed after commit; will reconcile"
+                    )
+                    self._safeReconcile()
+            else:
+                self._requeue(items)
+                self.inflight = ()
+                # This attempt's journal batch must not pile up across
+                # retries. Safe whether or not the commit actually landed:
+                # reconcile drops present rows, absent ones get replayed.
+                try:
+                    self._journalClear(batchid)
+                except Exception:
+                    logger.exception(
+                        "Journal clear failed after failed flush; "
+                        "will reconcile"
+                    )
+
+    # ----- Queries ---------------------------------------------------------
+
+    def _pendingRows(self, channel, minTime, maxTime):
+        "Snapshot deque + inflight; deduped (iso time, value) rows."
+        out = set()
+        for ch, ts, value in list(self.pending_data_items) + list(
+            self.inflight
+        ):
+            if ch == channel and minTime <= ts <= maxTime:
+                out.add((ts_to_iso(ts), value))
+        return out
+
+    def getDataRange(self, channel, minTime, maxTime, maxRecords=10000):
+        with self.lock:
+            conn = sqlite3.Connection(self.filename)
+            c = conn.execute(
+                "SELECT time,value FROM record WHERE time>? AND time<? "
+                "AND channel=? ORDER BY time ASC LIMIT ?",
+                (
+                    ts_to_iso(minTime),
+                    ts_to_iso(maxTime),
+                    channel,
+                    maxRecords,
+                ),
+            )
+            committed = set(c.fetchall())
+            conn.close()
+
+            pending = self._pendingRows(channel, minTime, maxTime)
+
+        # Merge committed and not-yet-committed by time, without duplicates.
+        return sorted(committed | pending)[:maxRecords]
+
+    def getRecent(self, channel, minTime, maxTime, maxRecords=10000):
+        with self.lock:
+            conn = sqlite3.Connection(self.filename)
+            c = conn.execute(
+                "SELECT time,value FROM record WHERE time>? AND time<? "
+                "AND channel=? ORDER BY time DESC LIMIT ?",
+                (
+                    ts_to_iso(minTime),
+                    ts_to_iso(maxTime),
+                    channel,
+                    maxRecords,
+                ),
+            )
+            committed = set(c.fetchall())
+            conn.close()
+
+            pending = self._pendingRows(channel, minTime, maxTime)
+
+        # Latest maxRecords, returned in ascending time order.
+        return sorted(committed | pending)[-maxRecords:]
+
 
 
 try:
     historian = TagHistorian(on_disk_history_db_path)
     ramHistorian = TagHistorian(ramdbfile)
     os.chmod(ramdbfile, 0o750)
+    os.chmod(ramdbfile + ".pending.sqlite", 0o750)
 except Exception:
     messagebus.post_message(
         "/system/notifications/errors",
